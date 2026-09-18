@@ -31,6 +31,13 @@
         "data": {
           "remote_fans": "Remotes to expose as fan entities"
         }
+      },
+      "remote_sensors": {
+        "title": "Remote sensors ({device_type})",
+        "description": "Optionally expose the live data a receive remote reports over RF (CO2, temperature, humidity, last command, ...) as sensors. Each selected remote becomes its own device. Only remotes that have reported data are listed. You can change this later in the integration options.",
+        "data": {
+          "remote_sensors": "Remotes to expose as sensors"
+        }
       }
     },
     "error": {
@@ -46,12 +53,13 @@
     "step": {
       "init": {
         "title": "Configure IthoWiFi",
-        "description": "Select which sensors and diagnostic items to include, and which RF or virtual remotes to expose as individual fan entities.",
+        "description": "Select which sensors and diagnostic items to include, which RF or virtual remotes to expose as individual fan entities, and which remotes to expose as sensors.",
         "data": {
           "sensors": "Sensors",
           "diagnostics": "Diagnostic items",
           "rf_source": "RF source",
-          "remote_fans": "RF and Virtual Remote devices"
+          "remote_fans": "RF and Virtual Remote devices",
+          "remote_sensors": "Remotes to expose as sensors"
         }
       }
     }

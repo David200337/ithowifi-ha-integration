@@ -69,6 +69,10 @@ CONF_DIAGNOSTICS = "diagnostics"
 CONF_RF_SOURCE = "rf_source"
 # List of per-remote fan selections, each entry "vr:<index>" or "rf:<index>"
 CONF_REMOTE_FANS = "remote_fans"
+# List of per-remote sensor selections (remotes whose received data — CO2,
+# temperature, last command, ... — is exposed as sensors), same "vr:<index>" /
+# "rf:<index>" encoding.
+CONF_REMOTE_SENSORS = "remote_sensors"
 
 # DemandFlow uses per-remote fans only (no main IthoFan). Detected by substring
 # so "DemandFlow" alone matches.

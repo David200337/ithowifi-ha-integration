@@ -24,6 +24,13 @@
         "data": {
           "remote_fans": "Afstandsbedieningen als fan-entiteit aanbieden"
         }
+      },
+      "remote_sensors": {
+        "title": "Afstandsbediening-sensoren ({device_type})",
+        "description": "Optioneel kunnen de live-gegevens die een ontvangende afstandsbediening via RF doorgeeft (CO2, temperatuur, luchtvochtigheid, laatste commando, ...) als sensoren worden aangeboden. Elke geselecteerde afstandsbediening wordt een eigen apparaat. Alleen afstandsbedieningen die gegevens hebben doorgegeven worden getoond. Dit kan later worden aangepast via de integratie-opties.",
+        "data": {
+          "remote_sensors": "Afstandsbedieningen als sensor aanbieden"
+        }
       }
     },
     "error": {
@@ -44,7 +51,8 @@
           "sensors": "Sensoren",
           "diagnostics": "Diagnostische items",
           "rf_source": "RF-bron",
-          "remote_fans": "RF- en Virtuele-afstandsbedieningen"
+          "remote_fans": "RF- en Virtuele-afstandsbedieningen",
+          "remote_sensors": "Afstandsbedieningen als sensor aanbieden"
         }
       }
     }

@@ -28,6 +28,7 @@ from .api import IthoWiFiApi, IthoWiFiApiError, IthoWiFiConnectionError, IthoWiF
 from .const import (
     CONF_DIAGNOSTICS,
     CONF_REMOTE_FANS,
+    CONF_REMOTE_SENSORS,
     CONF_RF_SOURCE,
     CONF_SENSORS,
     DIAGNOSTIC_KEYS,
@@ -81,6 +82,37 @@ def _build_remote_fan_options(
     return options, df_default
 
 
+def _build_remote_sensor_options(
+    rf_list: list[dict[str, Any]],
+    vr_list: list[dict[str, Any]],
+) -> list[SelectOptionDict]:
+    """Build selector options for per-remote sensors.
+
+    Offers every configured (non-empty) remote that currently reports a
+    `capabilities` object — i.e. a remote the add-on has received live data
+    from (CO2, temperature, last command, ...). Value is "vr:<index>" /
+    "rf:<index>", matching the fan selector encoding.
+    """
+    options: list[SelectOptionDict] = []
+
+    def _is_empty(r: dict[str, Any]) -> bool:
+        rid = r.get("id") or [0, 0, 0]
+        return all(b == 0 for b in rid[:3])
+
+    for kind, lst in (("rf", rf_list), ("vr", vr_list)):
+        label_kind = "RF Remote" if kind == "rf" else "Virtual Remote"
+        for r in lst:
+            if _is_empty(r):
+                continue
+            if not isinstance(r.get("capabilities"), dict):
+                continue
+            idx = r.get("index", 0)
+            label = f"{label_kind} {idx} — {r.get('name') or '(unnamed)'} ({r.get('remtypename') or 'unknown'})"
+            options.append(SelectOptionDict(value=f"{kind}:{idx}", label=label))
+
+    return options
+
+
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HOST): str,
@@ -111,6 +143,8 @@ class IthoWiFiConfigFlow(ConfigFlow, domain=DOMAIN):
         self._pending_diagnostics: list[str] = []
         self._remote_fan_opts: list[SelectOptionDict] = []
         self._remote_fan_default: list[str] = []
+        self._selected_remote_fans: list[str] = []
+        self._remote_sensor_opts: list[SelectOptionDict] = []
 
     async def async_step_user(
         self,
@@ -316,12 +350,13 @@ class IthoWiFiConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._remote_fan_opts = []
                 self._remote_fan_default = []
 
-        # Handle submission — or skip the step if there's nothing to show.
+        # Handle submission — or skip the step if there's nothing to show —
+        # then continue to the per-remote sensor selection.
         if user_input is not None or not self._remote_fan_opts:
-            selected = (
+            self._selected_remote_fans = (
                 user_input.get(CONF_REMOTE_FANS, []) if user_input else []
             )
-            return self._finalize_entry(selected)
+            return await self.async_step_remote_sensors()
 
         schema = vol.Schema(
             {
@@ -345,7 +380,71 @@ class IthoWiFiConfigFlow(ConfigFlow, domain=DOMAIN):
             },
         )
 
-    def _finalize_entry(self, remote_fans: list[str]) -> ConfigFlowResult:
+    async def async_step_remote_sensors(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Offer a per-remote sensor selection during initial setup.
+
+        Lists every configured remote that reports live data (CO2,
+        temperature, last command, ...), unchecked by default so the user
+        opts in — same UX as the per-remote fan selection. Skipped silently
+        when no such remotes exist.
+        """
+        if user_input is None and not self._remote_sensor_opts:
+            try:
+                session = async_get_clientsession(self.hass)
+                api = IthoWiFiApi(
+                    self._host, session, self._username, self._password
+                )
+                try:
+                    rf_list = await api.get_remotes()
+                except (IthoWiFiApiError, IthoWiFiConnectionError, IthoWiFiNotFoundError):
+                    rf_list = []
+                try:
+                    vr_list = await api.get_vremotes()
+                except (IthoWiFiApiError, IthoWiFiConnectionError, IthoWiFiNotFoundError):
+                    vr_list = []
+                self._remote_sensor_opts = _build_remote_sensor_options(rf_list, vr_list)
+            except Exception as ex:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Could not fetch remotes for sensor setup step: %s", ex
+                )
+                self._remote_sensor_opts = []
+
+        if user_input is not None or not self._remote_sensor_opts:
+            selected = (
+                user_input.get(CONF_REMOTE_SENSORS, []) if user_input else []
+            )
+            return self._finalize_entry(self._selected_remote_fans, selected)
+
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_REMOTE_SENSORS, default=[]
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=self._remote_sensor_opts,
+                        multiple=True,
+                        mode=SelectSelectorMode.LIST,
+                    )
+                )
+            }
+        )
+
+        return self.async_show_form(
+            step_id="remote_sensors",
+            data_schema=schema,
+            description_placeholders={
+                "device_type": self._deviceinfo.get("itho_devtype", "Unknown"),
+            },
+        )
+
+    def _finalize_entry(
+        self,
+        remote_fans: list[str],
+        remote_sensors: list[str] | None = None,
+    ) -> ConfigFlowResult:
         """Create the config entry with everything gathered across steps."""
         title = f"Itho {self._deviceinfo.get('itho_devtype', 'WiFi')}"
         return self.async_create_entry(
@@ -360,6 +459,7 @@ class IthoWiFiConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_DIAGNOSTICS: self._pending_diagnostics,
                 CONF_RF_SOURCE: getattr(self, "_selected_rf_source", ""),
                 CONF_REMOTE_FANS: remote_fans,
+                CONF_REMOTE_SENSORS: remote_sensors or [],
             },
         )
 
@@ -395,6 +495,7 @@ class IthoWiFiOptionsFlow(OptionsFlow):
 
         rf_sources: list[str] = []
         remote_fan_opts: list[SelectOptionDict] = []
+        remote_sensor_opts: list[SelectOptionDict] = []
         demandflow_default_remote_fans: list[str] = []
         is_df = False
 
@@ -424,6 +525,7 @@ class IthoWiFiOptionsFlow(OptionsFlow):
             remote_fan_opts, demandflow_default_remote_fans = _build_remote_fan_options(
                 rf_list, vr_list
             )
+            remote_sensor_opts = _build_remote_sensor_options(rf_list, vr_list)
 
             if rf_standalone:
                 rfdata = await api.get_rfstatus()
@@ -538,6 +640,26 @@ class IthoWiFiOptionsFlow(OptionsFlow):
             ] = SelectSelector(
                 SelectSelectorConfig(
                     options=remote_fan_opts,
+                    multiple=True,
+                    mode=SelectSelectorMode.LIST,
+                )
+            )
+
+        if remote_sensor_opts:
+            current_remote_sensors = (
+                self._config_entry.options.get(CONF_REMOTE_SENSORS) or []
+            )
+            valid_sensor_values = {o["value"] for o in remote_sensor_opts}
+            schema_dict[
+                vol.Optional(
+                    CONF_REMOTE_SENSORS,
+                    default=[
+                        v for v in current_remote_sensors if v in valid_sensor_values
+                    ],
+                )
+            ] = SelectSelector(
+                SelectSelectorConfig(
+                    options=remote_sensor_opts,
                     multiple=True,
                     mode=SelectSelectorMode.LIST,
                 )

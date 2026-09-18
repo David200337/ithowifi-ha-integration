@@ -35,7 +35,13 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_DIAGNOSTICS, CONF_SENSORS, DOMAIN, MANUFACTURER
+from .const import (
+    CONF_DIAGNOSTICS,
+    CONF_REMOTE_SENSORS,
+    CONF_SENSORS,
+    DOMAIN,
+    MANUFACTURER,
+)
 from .coordinator import (
     IthoDeviceInfoCoordinator,
     IthoRemotesCoordinator,
@@ -563,12 +569,15 @@ async def async_setup_entry(
 
     # Per-remote sensors: surface the live values a RECEIVE remote reports
     # over RF (CO2, temperature, humidity, battery, ...) plus its last
-    # received command. Sourced from the remotes coordinator; created for
-    # every non-empty remote that currently reports `capabilities`. Each such
-    # remote is exposed as its own sub-device grouped under the add-on.
+    # received command. Opt-in per remote via the CONF_REMOTE_SENSORS option
+    # (chosen in the setup/options flow, same as per-remote fans). Each
+    # selected remote is exposed as its own sub-device grouped under the add-on.
+    selected_remote_sensors = set(entry.options.get(CONF_REMOTE_SENSORS, []))
     remotes_coord: IthoRemotesCoordinator | None = data.get("remotes_coordinator")
-    if remotes_coord is not None:
-        entities.extend(_build_remote_sensors(remotes_coord, device_coord))
+    if remotes_coord is not None and selected_remote_sensors:
+        entities.extend(
+            _build_remote_sensors(remotes_coord, device_coord, selected_remote_sensors)
+        )
 
     async_add_entities(entities)
 
@@ -803,12 +812,14 @@ def _remote_is_empty(remote: dict[str, Any]) -> bool:
 def _build_remote_sensors(
     remotes_coord: IthoRemotesCoordinator,
     device_coord: IthoDeviceInfoCoordinator,
+    selected: set[str],
 ) -> list[SensorEntity]:
-    """Create per-remote sensor entities for remotes reporting capabilities.
+    """Create per-remote sensor entities for the selected remotes.
 
-    Only capabilities present in the current coordinator data get an entity
-    (a rescan/reload surfaces newly-appearing ones). Empty slots and remotes
-    without a `capabilities` object are skipped.
+    `selected` holds "rf:<index>" / "vr:<index>" entries chosen in the
+    setup/options flow. Only capabilities present in the current coordinator
+    data get an entity (a rescan/reload surfaces newly-appearing ones). Empty
+    slots and remotes without a `capabilities` object are skipped.
     """
     out: list[SensorEntity] = []
     data = remotes_coord.data or {}
@@ -816,10 +827,12 @@ def _build_remote_sensors(
         for remote in data.get(kind, []):
             if _remote_is_empty(remote):
                 continue
+            index = int(remote.get("index", 0))
+            if f"{kind}:{index}" not in selected:
+                continue
             caps = remote.get("capabilities")
             if not isinstance(caps, dict):
                 continue
-            index = int(remote.get("index", 0))
             for cap_key, meta in _REMOTE_CAP_SENSORS.items():
                 if caps.get(cap_key) is not None:
                     out.append(
