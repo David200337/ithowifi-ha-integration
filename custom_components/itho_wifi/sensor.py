@@ -31,10 +31,16 @@ try:
 except AttributeError:
     _MWH = "MWh"
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_DIAGNOSTICS, CONF_SENSORS, DOMAIN
-from .coordinator import IthoDeviceInfoCoordinator, IthoStatusCoordinator
+from .const import CONF_DIAGNOSTICS, CONF_SENSORS, DOMAIN, MANUFACTURER
+from .coordinator import (
+    IthoDeviceInfoCoordinator,
+    IthoRemotesCoordinator,
+    IthoStatusCoordinator,
+)
 from .entity import IthoEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -555,6 +561,15 @@ async def async_setup_entry(
     # Device info diagnostic sensors
     entities.append(IthoDeviceInfoSensor(status_coord, device_coord))
 
+    # Per-remote sensors: surface the live values a RECEIVE remote reports
+    # over RF (CO2, temperature, humidity, battery, ...) plus its last
+    # received command. Sourced from the remotes coordinator; created for
+    # every non-empty remote that currently reports `capabilities`. Each such
+    # remote is exposed as its own sub-device grouped under the add-on.
+    remotes_coord: IthoRemotesCoordinator | None = data.get("remotes_coordinator")
+    if remotes_coord is not None:
+        entities.extend(_build_remote_sensors(remotes_coord, device_coord))
+
     async_add_entities(entities)
 
 
@@ -723,3 +738,218 @@ class IthoDeviceInfoSensor(IthoEntity, SensorEntity):
         if "itho_deviceid" in info:
             attrs["device_id"] = info["itho_deviceid"]
         return attrs
+
+
+# Per-remote capability -> sensor metadata. Mirrors the firmware's own MQTT
+# discovery (HADiscovery.cpp) for received-RF sensor values. Scaling note:
+# co2 (ppm), hum (%) and battery (%) arrive already in their final unit, but
+# temp/dewpoint/setpoint arrive as centidegrees, so they are scaled x0.01.
+_REMOTE_CAP_SENSORS: dict[str, dict[str, Any]] = {
+    "co2": {
+        "name": "CO2", "unit": "ppm", "device_class": SensorDeviceClass.CO2,
+        "state_class": SensorStateClass.MEASUREMENT, "scale": 1.0,
+    },
+    "temp": {
+        "name": "Temperature", "unit": UnitOfTemperature.CELSIUS,
+        "device_class": SensorDeviceClass.TEMPERATURE,
+        "state_class": SensorStateClass.MEASUREMENT, "scale": 0.01,
+    },
+    "hum": {
+        "name": "Humidity", "unit": PERCENTAGE,
+        "device_class": SensorDeviceClass.HUMIDITY,
+        "state_class": SensorStateClass.MEASUREMENT, "scale": 1.0,
+    },
+    "dewpoint": {
+        "name": "Dew point", "unit": UnitOfTemperature.CELSIUS,
+        "device_class": SensorDeviceClass.TEMPERATURE,
+        "state_class": SensorStateClass.MEASUREMENT, "scale": 0.01,
+    },
+    "setpoint": {
+        "name": "Setpoint", "unit": UnitOfTemperature.CELSIUS,
+        "device_class": SensorDeviceClass.TEMPERATURE,
+        "state_class": SensorStateClass.MEASUREMENT, "scale": 0.01,
+    },
+    "battery": {
+        "name": "Battery", "unit": PERCENTAGE,
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT, "scale": 1.0,
+        "entity_category": EntityCategory.DIAGNOSTIC,
+    },
+    "pir": {
+        "name": "Motion", "unit": None, "device_class": None,
+        "state_class": None, "scale": 1.0, "icon": "mdi:motion-sensor",
+    },
+}
+
+# Special (non-measurement) per-remote sensors.
+_REMOTE_LASTCMD_META: dict[str, Any] = {
+    "name": "Last command", "unit": None, "device_class": None,
+    "state_class": None, "scale": None, "icon": "mdi:console",
+    "entity_category": EntityCategory.DIAGNOSTIC,
+}
+_REMOTE_TIME_META: dict[str, Any] = {
+    "name": "Last command time", "unit": None,
+    "device_class": SensorDeviceClass.TIMESTAMP, "state_class": None,
+    "scale": None, "entity_category": EntityCategory.DIAGNOSTIC,
+}
+
+
+def _remote_is_empty(remote: dict[str, Any]) -> bool:
+    """Match the firmware's isEmptySlot() check (all ID bytes zero)."""
+    rid = remote.get("id") or [0, 0, 0]
+    return all(b == 0 for b in rid[:3])
+
+
+def _build_remote_sensors(
+    remotes_coord: IthoRemotesCoordinator,
+    device_coord: IthoDeviceInfoCoordinator,
+) -> list[SensorEntity]:
+    """Create per-remote sensor entities for remotes reporting capabilities.
+
+    Only capabilities present in the current coordinator data get an entity
+    (a rescan/reload surfaces newly-appearing ones). Empty slots and remotes
+    without a `capabilities` object are skipped.
+    """
+    out: list[SensorEntity] = []
+    data = remotes_coord.data or {}
+    for kind in ("rf", "vr"):
+        for remote in data.get(kind, []):
+            if _remote_is_empty(remote):
+                continue
+            caps = remote.get("capabilities")
+            if not isinstance(caps, dict):
+                continue
+            index = int(remote.get("index", 0))
+            for cap_key, meta in _REMOTE_CAP_SENSORS.items():
+                if caps.get(cap_key) is not None:
+                    out.append(
+                        IthoRemoteSensor(remotes_coord, device_coord, kind, index, cap_key, meta)
+                    )
+            if caps.get("lastcmdmsg") is not None or caps.get("lastcmd") is not None:
+                out.append(
+                    IthoRemoteSensor(remotes_coord, device_coord, kind, index, "lastcmdmsg", _REMOTE_LASTCMD_META)
+                )
+            if caps.get("timestamp") is not None:
+                out.append(
+                    IthoRemoteSensor(remotes_coord, device_coord, kind, index, "timestamp", _REMOTE_TIME_META)
+                )
+    return out
+
+
+class IthoRemoteSensor(CoordinatorEntity[IthoRemotesCoordinator], SensorEntity):
+    """A sensor for one capability of a single RF or virtual remote.
+
+    Values come from the remotes coordinator (`/api/v2/remotes` and
+    `/api/v2/vremotes`), whose per-remote `capabilities` object is populated
+    from received RF frames (CO2, temperature, humidity, battery, last
+    command, ...). Each remote is exposed as its own sub-device grouped under
+    the main add-on device via `via_device`.
+    """
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: IthoRemotesCoordinator,
+        device_info_coordinator: IthoDeviceInfoCoordinator,
+        kind: str,
+        index: int,
+        cap_key: str,
+        meta: dict[str, Any],
+    ) -> None:
+        """Initialize a per-remote capability sensor."""
+        super().__init__(coordinator)
+        self._device_info_coordinator = device_info_coordinator
+        self._kind = kind  # "rf" or "vr"
+        self._index = index
+        self._cap = cap_key
+        self._scale = meta.get("scale")
+        hwid = (device_info_coordinator.data or {}).get("add-on_hwid", "itho")
+        self._remote_uid = f"{hwid}_{kind}_{index}"
+        self._attr_unique_id = f"{self._remote_uid}_{cap_key}"
+        self._attr_name = meta["name"]
+        if meta.get("unit") is not None:
+            self._attr_native_unit_of_measurement = meta["unit"]
+        if meta.get("device_class") is not None:
+            self._attr_device_class = meta["device_class"]
+        if meta.get("state_class") is not None:
+            self._attr_state_class = meta["state_class"]
+        if meta.get("icon") is not None:
+            self._attr_icon = meta["icon"]
+        if meta.get("entity_category") is not None:
+            self._attr_entity_category = meta["entity_category"]
+
+    def _remote(self) -> dict[str, Any] | None:
+        """Find this entity's remote in the coordinator's latest data."""
+        data = self.coordinator.data or {}
+        for r in data.get(self._kind, []):
+            if r.get("index") == self._index:
+                return r
+        return None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Expose each remote as its own sub-device under the add-on."""
+        info = self._device_info_coordinator.data or {}
+        main = info.get("add-on_hwid", "unknown")
+        r = self._remote() or {}
+        rname = r.get("name") or f"{self._index}"
+        rtype = r.get("remtypename") or (
+            "Virtual remote" if self._kind == "vr" else "RF remote"
+        )
+        rfunc = r.get("remfuncname") or ""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._remote_uid)},
+            name=f"{rname} ({rtype})",
+            manufacturer=MANUFACTURER,
+            model=(f"{rfunc} remote").strip(),
+            via_device=(DOMAIN, main),
+        )
+
+    def _value_from_caps(self, caps: dict[str, Any]) -> Any:
+        """Extract and normalize this sensor's value from a capabilities dict."""
+        if self._cap == "lastcmdmsg":
+            msg = caps.get("lastcmdmsg")
+            if msg is None:
+                code = caps.get("lastcmd")
+                return None if code is None else str(code)
+            # Strip the firmware's "Itho" prefix (IthoLow -> Low).
+            if isinstance(msg, str) and msg.startswith("Itho"):
+                return msg[4:]
+            return msg
+        val = caps.get(self._cap)
+        if val is None:
+            return None
+        if self._cap == "timestamp":
+            try:
+                return datetime.fromtimestamp(int(val), tz=timezone.utc)
+            except (TypeError, ValueError, OSError, OverflowError):
+                return None
+        if self._scale and self._scale != 1.0:
+            try:
+                return round(float(val) * self._scale, 2)
+            except (TypeError, ValueError):
+                return val
+        return val
+
+    @property
+    def available(self) -> bool:
+        """Available while the slot exists and this capability has a value."""
+        if not super().available:
+            return False
+        r = self._remote()
+        if r is None or _remote_is_empty(r):
+            return False
+        caps = r.get("capabilities")
+        return isinstance(caps, dict) and self._value_from_caps(caps) is not None
+
+    @property
+    def native_value(self) -> Any:
+        """Return the current value for this remote capability."""
+        r = self._remote()
+        if r is None:
+            return None
+        caps = r.get("capabilities")
+        if not isinstance(caps, dict):
+            return None
+        return self._value_from_caps(caps)
