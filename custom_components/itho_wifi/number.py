@@ -58,35 +58,46 @@ class IthoFanDemandNumber(IthoEntity, NumberEntity):
     ) -> None:
         """Initialize the number entity."""
         super().__init__(coordinator, device_info_coordinator)
+
         info = device_info_coordinator.data or {}
         self._attr_unique_id = (
             f"{info.get('add-on_hwid', 'itho')}_fan_demand"
         )
 
+        self._last_demand: float | None = None
+
     @property
     def native_value(self) -> float | None:
         """Return the current fan speed as percentage."""
         if self.coordinator.data is None:
-            return None
-        # Prefer Speed status from ithostatus (works when PWM2I2C is off)
-        status = self.coordinator.data.get("status", {})
-        val = status.get("Speed status")
-        if val is not None and val != "not available":
-            return min(round(float(val)), 100)
-        # Fall back to currentspeed
-        speed = self.coordinator.data.get("speed", {}).get("currentspeed")
-        if speed is None:
-            return None
-        return min(round(speed / 2.55), 100)
+            return self._last_demand
+
+        lastcmd = self.coordinator.data.get("lastcmd", {})
+        command = str(lastcmd.get("command", ""))
+
+        match = re.search(r"\brfdemand:(\d+)", command)
+
+        if match:
+            demand = max(0, min(int(match.group(1)), 200))
+            self._last_demand = demand / 2
+            return self._last_demand
+
+        return self._last_demand
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the fan demand. Tries RF demand first, falls back to speed."""
         try:
             await self.coordinator.api.send_rf_command("auto")
+
             demand = int(value * 2)  # 0-100% → 0-200 demand
             await self.coordinator.api.send_rf_demand(demand)
+
+            self._last_demand = value
+            self.async_write_ha_state()
+
         except Exception:
             import math
             speed = math.ceil(value * 2.55)
             await self.coordinator.api.set_speed(speed)
+
         await self.coordinator.async_request_refresh()
