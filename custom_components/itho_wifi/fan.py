@@ -6,6 +6,7 @@ import asyncio
 import math
 from typing import Any
 
+from .helpers import get_rf_demand_percent
 from homeassistant.components.fan import (
     FanEntity,
     FanEntityFeature,
@@ -241,7 +242,7 @@ class IthoFan(IthoEntity, FanEntity):
         if self.coordinator.data is None:
             return None
 
-        if seld.use_rf_commands:
+        if self._use_rf_commands:
             demand = get_rf_demand_percent(self.coordinator.data)
             if demand is not None:
                 return demand

@@ -1,3 +1,5 @@
+import re
+
 def get_rf_demand_percent(data: dict) -> int | None:
     lastcmd = data.get("lastcmd", {})
     command = str(lastcmd.get("command", ""))
