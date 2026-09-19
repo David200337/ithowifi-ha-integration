@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from typing import Any
 
-from .helpers import get_rf_demand_percent
 from homeassistant.components.fan import (
     FanEntity,
     FanEntityFeature,
@@ -36,6 +34,7 @@ from .coordinator import (
     IthoStatusCoordinator,
 )
 from .entity import IthoEntity
+from .helpers import pick_main_fan_rf_index
 
 PRESET_MODES = [
     PRESET_LOW,
@@ -97,27 +96,6 @@ def _parse_remote_fans(selection: list[str]) -> list[tuple[str, int]]:
         except (ValueError, AttributeError):
             continue
     return parsed
-
-
-def pick_main_fan_rf_index(remotes_coordinator: IthoRemotesCoordinator) -> int:
-    """Return the RF remote index used for main-fan RF dispatch.
-
-    Picks the first non-empty SEND remote (remfunc == 5) from the
-    remotes coordinator's latest data. This is the remote the user
-    explicitly configured to control the Itho unit — avoids the prior
-    behavior of always using index 0, which on some setups points to a
-    RECEIVE remote that isn't meant to transmit. Falls back to 0 if the
-    coordinator has no data yet or no SEND remote is configured.
-    """
-    data = remotes_coordinator.data or {}
-    for r in data.get("rf", []):
-        if r.get("remfunc") != 5:  # SEND
-            continue
-        rid = r.get("id") or [0, 0, 0]
-        if all(b == 0 for b in rid[:3]):
-            continue
-        return int(r.get("index", 0))
-    return 0
 
 
 def _is_empty_slot(remote: dict[str, Any]) -> bool:
@@ -231,21 +209,20 @@ class IthoFan(IthoEntity, FanEntity):
         self._attr_unique_id = f"{info.get('add-on_hwid', 'itho')}_{self._attr_unique_id_suffix}"
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
         """Return true if the fan is on."""
         pct = self.percentage
-        return pct is not None and pct > 0
+        return pct > 0 if pct is not None else None
 
     @property
     def percentage(self) -> int | None:
-        """Return the current speed percentage."""
+        """Return requested demand in RF mode, otherwise measured speed."""
         if self.coordinator.data is None:
             return None
 
         if self._use_rf_commands:
-            demand = get_rf_demand_percent(self.coordinator.data)
-            if demand is not None:
-                return demand
+            demand = self.coordinator.fan_demand_percent
+            return round(demand) if demand is not None else None
 
         # Try Speed status from ithostatus (works for both RF standalone and
         # hybrid I2C+RF mode where currentspeed is 0)
@@ -277,62 +254,9 @@ class IthoFan(IthoEntity, FanEntity):
         """Return the RF remote index used for main-fan RF dispatch."""
         return pick_main_fan_rf_index(self._remotes_coordinator)
 
-    def _fan_in_auto(self) -> bool:
-        """Return True only if we can confirm the unit is currently in auto mode.
-
-        Returns False both when the unit is in a fixed mode (low/medium/high/
-        timer/away/...) and when we have no FanInfo data (e.g. RF standalone
-        without an rf_source configured). Used to decide whether to precede
-        the 31E0 demand frame with an "auto" RF command — the unit only
-        accepts demand frames when in auto mode, so we send "auto" first
-        when not confirmed-auto, but skip it when confirmed-auto to avoid
-        the boost-mode side-effect that ignores subsequent lower demands.
-        """
-        if not self.coordinator.data:
-            return False
-        status = self.coordinator.data.get("status") or {}
-
-        # I2C 31DA path: ithostatus dict with "FanInfo" as a top-level key.
-        fi = status.get("FanInfo") or status.get("fan-info")
-        if fi:
-            return str(fi).strip().lower() == "auto"
-
-        # rfstatus path: sources -> measurements31DA -> {name, value}.
-        for src in status.get("sources", []) or []:
-            for m in src.get("measurements31DA", []) or []:
-                if m.get("name") in ("FanInfo", "fan-info"):
-                    v = m.get("value")
-                    if v is not None:
-                        return str(v).strip().lower() == "auto"
-
-        return False
-
     async def async_set_percentage(self, percentage: int) -> None:
-        """Set the speed percentage.
-
-        Dispatch follows the same shape as async_set_preset_mode:
-        * use_rf_commands → 31E0 demand frame, optionally preceded by an
-          "auto" RF command when the unit isn't already in auto mode (the
-          unit only accepts demand frames when in auto; sending "auto"
-          when already in auto produces a boost-mode side-effect that
-          drops subsequent lower demand values).
-        * otherwise → direct PWM speed write via /api/v2/command. On
-          PWM2I2C-only units (no RFT CO2 SEND remote configured) the
-          RF path would only spam firmware error logs and silently fail.
-        """
-        if self._use_rf_commands:
-            try:
-                idx = self._rf_index()
-                demand = percentage * 2  # 0-100% → 0-200 demand
-                if not self._fan_in_auto():
-                    await self.coordinator.api.send_rf_command("auto", idx)
-                await self.coordinator.api.send_rf_demand(demand, index=idx)
-            except Exception:
-                speed = math.ceil(percentage * 2.55)
-                await self.coordinator.api.set_speed(speed)
-        else:
-            speed = math.ceil(percentage * 2.55)
-            await self.coordinator.api.set_speed(speed)
+        """Set requested demand in RF mode, or direct speed otherwise."""
+        await self.coordinator.async_set_fan_demand(percentage)
         await self._async_refresh()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:

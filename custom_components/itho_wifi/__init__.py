@@ -71,7 +71,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, api, rf_standalone=rf_standalone, rf_source_name=rf_source_name
     )
     status_coordinator.use_rf_commands = use_rf_commands
-    await status_coordinator.async_config_entry_first_refresh()
 
     # Remotes coordinator drives per-remote fan entities. First refresh is
     # allowed to fail (empty data) — this is an additive feature and the
@@ -82,6 +81,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await remotes_coordinator.async_config_entry_first_refresh()
     except Exception as err:  # noqa: BLE001
         _LOGGER.warning("Initial remotes fetch failed: %s", err)
+
+    status_coordinator.remotes_coordinator = remotes_coordinator
+    await status_coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
