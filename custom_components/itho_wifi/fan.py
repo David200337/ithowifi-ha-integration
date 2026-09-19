@@ -240,16 +240,25 @@ class IthoFan(IthoEntity, FanEntity):
         """Return the current speed percentage."""
         if self.coordinator.data is None:
             return None
+
+        if seld.use_rf_commands:
+            demand = get_rf_demand_percent(self.coordinator.data)
+            if demand is not None:
+                return demand
+
         # Try Speed status from ithostatus (works for both RF standalone and
         # hybrid I2C+RF mode where currentspeed is 0)
         status = self.coordinator.data.get("status", {})
         val = status.get("Speed status")
+
         if val is not None and val != "not available":
             return min(round(float(val)), 100)
+
         # Fall back to currentspeed from /api/v2/speed
         speed = self.coordinator.data.get("speed", {}).get("currentspeed")
         if speed is None:
             return None
+
         return min(round(speed / 2.55), 100)
 
     @property
